@@ -10,6 +10,7 @@ KERNEL=$FULL_BUILD/kernel
 IMG=$FULL_BUILD/img
 
 mkdir -p $FULL_BUILD
+ln -s $FULL_BUILD build
 chmod 1777 $BUILD
 chmod 0750 $FULL_BUILD
 
