@@ -250,7 +250,11 @@ int_panic_origin: ; Interrupt 0x61
 panic_info:
 	DB "%:"
 
-buffer: ; Int Addresses & Init are used as a buffer (since they are only used once)
+; Int Addresses & Init are used as a buffer (since they are only used once)
+buffer_drive_paramaters:
+	DB 0x1A ; Size (v1.x) - May be changed by BIOS, but we don't care
+	        ; (this is a bigger problem if we put it on the stack)
+buffer:
 
 int_addresses:
 	DW int_ss
@@ -289,36 +293,37 @@ next_ivt_interrupt:
 	movsw ; Address
 	stosw ; AX = CS = 0
 	loop next_ivt_interrupt
-load1024:
-	; We are going read the bytes 512-1024 of the disk to 0x7E00-0x7FFF since
-	; we aren't fitting everything in just 512 bytes.
-	; (I mean the addresses are just begging us to do it and EXT4 reserves a
-	; 1024 byte region at the start of the filesystem for bootloaders / MBR
-	; so yah, and we're not fitting everything otherwise.)
+init_paramaters:
+	; We set up the paramaters early to delay the interrupt instructions as much as
+	; possible. This is done to maximize expand the buffer space for interrupt calls.
 
-	; Source
+	; INT_DISK_BYTE_READ
+	mov di, end_bios_loaded
 	xchg bx, ax ; BX = 0
-	mov ax, 512
+	mov ax, end_code - end_bios_loaded ; SHOULD be 1024
 	mov cx, ax
-	; Output
-	mov di, 0x7E00
-	; Interrupt
+
+	; INT_READ_FAT_FILE
+	xor dh, dh
+	mov si, kernel_path
+load1024:
+	; Load the rest of the bootloader from disk into memory.
 	int INT_DISK_BYTE_READ
+buffer_end: ; IP Return Address for interrupt
 	jc int_panic
 load_kernel:
-	; Output
 	push KERNEL_SEGMENT
 	pop es
 	mov di, KERNEL_ADDRESS
-	; File name
-	mov si, kernel_path
-	; Interrupt
-	xor dh, dh ; Any partition from zero works
+
 	int INT_READ_FAT_FILE
 	jc int_panic
 enter_kernel:
 	jmp KERNEL_SEGMENT:KERNEL_ADDRESS
 
+%define STACK_EFLAGS bp + 0x16
+%define STACK_CS bp + 0x14
+%define STACK_IP bp + 0x12
 %define STACK_AX bp + 0x10
 %define STACK_CX bp + 0x0E
 %define STACK_DX bp + 0x0C
@@ -377,9 +382,11 @@ int_div_dword:
 	push di
 	push si
 
-	; BP:DI = Divisor 
-	mov bp, bx
-	mov di, cx
+	; BP:DI = Divisor (2's compliment)
+	xor di, di
+	xor bp, bp
+	sub di, cx
+	sbb bp, bx
 
 	; BX:SI = Remainder
 	xor bx, bx
@@ -389,28 +396,27 @@ int_div_dword:
 	mov cx, 32
 
 	; BP:DI | CF:[BX:SI]:[DX:AX]
+division_step_clc:
 	clc
 division_step:
 	; Rotate division buffer
 	rcl ax, 1
 	rcl dx, 1
+	jcxz division_return ; Remainder already complete
 	rcl si, 1
 	rol bx, 1 ; We won't ever have a bit that shifts into CF
+	inc cx
 
 	; Check if we can divide
-	sub si, di
-	sbb bx, bp
-	jbe division_success
-division_failure:
-	; Undo subtraction
 	add si, di
 	adc bx, bp
-	clc
-	loop division_step
-	jmp division_return
-division_success:
-	stc ; ZF = 1
-	loop division_step
+	jc division_step ; (success)
+division_failure:
+	; Undo subtraction
+	sub si, di
+	sbb bx, bp
+	jmp division_step_clc
+
 division_return:
 	mov cx, si
 	pop si
@@ -445,8 +451,7 @@ find_sector_size: ; AX = Sector buffer size ; DI = Sectors
 ;OFF:SIZE
 ; 0h:1h ; Size
 ;18h:2h ; Bytes per sector
-	mov si, buffer
-	mov BYTE [si], 0x1A ; Size (v1.x)
+	mov si, buffer_drive_paramaters
 	mov ax, 48h << 8 | 'p'
 	int 13h
 	jc error_iret
@@ -455,14 +460,11 @@ find_sector_size: ; AX = Sector buffer size ; DI = Sectors
 return_sector_size:
 	mov WORD [ss: STACK_CX], cx ; BIOS could be cringe and give us different DS:SI buffer
 success_iret:
+	and BYTE [ss: STACK_EFLAGS], ~1 ; CF
+generic_iret:
 	mov sp, bp
-
 	pop ds
 	popa
-
-	popf
-	clc
-	pushf
 	iret
 
 ; Interrupt 0x64
@@ -471,7 +473,6 @@ int_disk_stack_read:
 	push ds
 	mov bp, sp
 
-	; DS = SS
 	push ss
 	pop ds
 read_sector:
@@ -508,7 +509,7 @@ read_sector:
 	mov al, 'r'
 	jc error_iret
 return_sector:
-	mov [STACK_SI], sp
+	mov WORD [STACK_SI], sp
 	jmp success_iret
 
 ; Interrupt 0x65 - aka. where register preasure was invented
@@ -517,8 +518,8 @@ int_disk_byte_read:
 	push ds
 	mov bp, sp
 
-	push ds
-	pop ss
+	push ss
+	pop ds
 get_sector_size:
 	int INT_DISK_SECTOR_SIZE
 	jc error_iret
@@ -558,16 +559,9 @@ ss_exception_iret:
 	int int_ss ; #SS
 	mov al, 'S'
 error_iret:
-	mov sp, bp
-	mov [STACK_AX], ax
-
-	pop ds
-	popa
-
-	popf
-	stc
-	pushf
-	iret
+	or BYTE [ss: STACK_EFLAGS], 1 ; CF
+	mov WORD [STACK_AX], ax
+	jmp generic_iret
 
 	TIMES 0x01B8-($-$$) DB 0 ; Zero to MBR
 mbr:	DD "X86O" ; Disk ID
@@ -578,6 +572,7 @@ part3:	DD 0, 0, 0, 0
 part4:	DD 0, 0, 0, 0
 
 sig:	DB 0x55, 0xAA ; Bootsector / MBR Signature
+end_bios_loaded:
 
 ; Interrupt 0x67 - aka. where math was invented
 int_stat_fat_file:
@@ -799,3 +794,4 @@ int_read_fat_file:
 	jmp error_iret
 
 	TIMES 0x0400-($-$$) DB 0 ; Zero to end of sector
+end_code:
